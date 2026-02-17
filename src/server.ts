@@ -3,7 +3,7 @@ import * as path from 'path';
 import { fileURLToPath } from 'url';
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { Version3Client } from 'jira.js';
+import { Version2Client, Version3Client } from 'jira.js';
 import { z } from 'zod';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -17,16 +17,35 @@ try {
   console.error("Error loading .env file:", e);
 }
 
-// Initialize Jira client
-const jira = new Version3Client({
-  host: process.env.JIRA_HOST!,
-  authentication: {
-    basic: {
-      email: process.env.JIRA_EMAIL!,
-      apiToken: process.env.JIRA_API_TOKEN!,
+// Determine auth type: "pat" for Jira Server (Bearer token), "basic" for Jira Cloud
+const authType = (process.env.JIRA_AUTH_TYPE || 'basic').toLowerCase();
+const isJiraServer = authType === 'pat';
+
+// Initialize Jira client based on auth type.
+// We use 'any' for the client type because Version2Client and Version3Client
+// share the same method structure but TypeScript can't resolve the union.
+let jira: any;
+
+if (isJiraServer) {
+  jira = new Version2Client({
+    host: process.env.JIRA_HOST!,
+    authentication: {
+      personalAccessToken: process.env.JIRA_API_TOKEN!,
     },
-  },
-});
+  });
+  console.error(`Jira client initialized for Server (PAT auth) at ${process.env.JIRA_HOST}`);
+} else {
+  jira = new Version3Client({
+    host: process.env.JIRA_HOST!,
+    authentication: {
+      basic: {
+        email: process.env.JIRA_EMAIL!,
+        apiToken: process.env.JIRA_API_TOKEN!,
+      },
+    },
+  });
+  console.error(`Jira client initialized for Cloud (Basic auth) at ${process.env.JIRA_HOST}`);
+}
 
 // Type definitions
 interface JiraTicket {
@@ -62,6 +81,22 @@ const StatusUpdateSchema = z.object({
   transitionId: z.string().describe("The ID of the transition to perform"),
 });
 
+// Helper function to extract description text.
+// Jira Cloud (v3) uses ADF format, Jira Server (v2) uses plain text/wiki markup.
+function extractDescription(description: any): string {
+  if (!description) {
+    return '';
+  }
+
+  // If it's a plain string (Jira Server v2), return directly
+  if (typeof description === 'string') {
+    return description;
+  }
+
+  // Otherwise parse ADF (Jira Cloud v3)
+  return extractTextFromADF(description);
+}
+
 // Helper function to recursively extract text from ADF nodes
 function extractTextFromADF(node: any): string {
   if (!node) {
@@ -89,8 +124,8 @@ function extractTextFromADF(node: any): string {
 // Helper function to validate Jira configuration
 function validateJiraConfig(): string | null {
   if (!process.env.JIRA_HOST) return "JIRA_HOST environment variable is not set";
-  if (!process.env.JIRA_EMAIL) return "JIRA_EMAIL environment variable is not set";
   if (!process.env.JIRA_API_TOKEN) return "JIRA_API_TOKEN environment variable is not set";
+  if (!isJiraServer && !process.env.JIRA_EMAIL) return "JIRA_EMAIL environment variable is not set (required for Cloud/basic auth)";
   return null;
 }
 
@@ -139,7 +174,7 @@ server.tool(
         };
       }
 
-      const formattedTickets = tickets.issues.map((issue) => {
+      const formattedTickets = tickets.issues.map((issue: any) => {
         const summary = issue.fields?.summary || 'No summary';
         const status = issue.fields?.status?.name || 'Unknown status';
         return `${issue.key}: ${summary} (${status})`;
@@ -181,7 +216,7 @@ server.tool(
         `Summary: ${ticket.fields?.summary || 'No summary'}`,
         `Status: ${ticket.fields?.status?.name || 'Unknown status'}`,
         `Type: ${ticket.fields?.issuetype?.name || 'Unknown type'}`,
-        `Description:\n${extractTextFromADF(ticket.fields?.description) || 'No description'}`,
+        `Description:\n${extractDescription(ticket.fields?.description) || 'No description'}`,
         `Parent: ${ticket.fields?.parent?.key || 'No parent'}`
       ];
 
@@ -243,13 +278,13 @@ server.tool(
         };
       }
 
-      const formattedComments = commentsResult.comments.map(comment => {
+      const formattedComments = commentsResult.comments.map((comment: any) => {
         const author = comment.author?.displayName || 'Unknown Author';
-        // Comments also use ADF, so we need to parse them
-        const body = extractTextFromADF(comment.body) || 'No comment body'; 
+        // Cloud uses ADF for comments, Server uses plain text
+        const body = extractDescription(comment.body) || 'No comment body';
         const createdDate = comment.created ? new Date(comment.created).toLocaleString() : 'Unknown date';
-        return `[${createdDate}] ${author}:\n${body.trim()}\n---`; // Added trim() and separator
-      }).join('\n\n'); // Separate comments with double newline
+        return `[${createdDate}] ${author}:\n${body.trim()}\n---`;
+      }).join('\n\n');
 
       return {
         content: [{ type: "text", text: formattedComments }],
@@ -419,7 +454,7 @@ server.tool(
       }
 
       // Format the results with descriptions
-      const formattedResults = searchResults.issues.map(issue => {
+      const formattedResults = searchResults.issues.map((issue: any) => {
         const summary = issue.fields?.summary || 'No summary';
         const status = issue.fields?.status?.name || 'Unknown status';
         const project = issue.fields?.project?.key || 'Unknown project';
@@ -427,7 +462,7 @@ server.tool(
           new Date(issue.fields.updated).toLocaleString() :
           'Unknown date';
         const description = issue.fields?.description ? 
-          extractTextFromADF(issue.fields.description) : 
+          extractDescription(issue.fields.description) : 
           'No description';
         
         return `[${project}] ${issue.key}: ${summary}
